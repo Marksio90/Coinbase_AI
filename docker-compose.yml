@@ -1,2 +1,294 @@
 version: "3.9"
-services: {}
+
+# ----------------------------------------------------------------------------
+# Shared defaults for application services.
+# ----------------------------------------------------------------------------
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  env_file:
+    - .env
+  networks:
+    - trading-net
+
+services:
+  # --------------------------------------------------------------------------
+  # Core data layer.
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-coinbase_ai}
+      POSTGRES_USER: ${POSTGRES_USER:-coinbase_ai_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_password_example}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/postgres/init.sql:/docker-entrypoint-initdb.d/010-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-coinbase_ai_user} -d ${POSTGRES_DB:-coinbase_ai}"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+      start_period: 20s
+    networks:
+      - trading-net
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 8
+    networks:
+      - trading-net
+
+  # --------------------------------------------------------------------------
+  # Market ingestion + decisioning chain.
+  # --------------------------------------------------------------------------
+  market-gateway:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/market-gateway/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./storage/logs:/app/storage/logs
+      - ./storage/state:/app/storage/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+  strategy-engine:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/strategy-engine/Dockerfile
+    depends_on:
+      market-gateway:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./storage/logs:/app/storage/logs
+      - ./storage/state:/app/storage/state
+
+  risk-engine:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/risk-engine/Dockerfile
+    depends_on:
+      strategy-engine:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./storage/logs:/app/storage/logs
+      - ./storage/state:/app/storage/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+  execution-engine:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/execution-engine/Dockerfile
+    depends_on:
+      risk-engine:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./storage/logs:/app/storage/logs
+      - ./storage/state:/app/storage/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+  portfolio-engine:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/portfolio-engine/Dockerfile
+    depends_on:
+      execution-engine:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./storage/logs:/app/storage/logs
+      - ./storage/state:/app/storage/state
+
+  orchestrator:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    depends_on:
+      strategy-engine:
+        condition: service_started
+      risk-engine:
+        condition: service_healthy
+      execution-engine:
+        condition: service_healthy
+      portfolio-engine:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./storage/logs:/app/storage/logs
+      - ./storage/state:/app/storage/state
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+  # --------------------------------------------------------------------------
+  # AI assistants for signal/risk enrichment.
+  # --------------------------------------------------------------------------
+  ai-market-analyst:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/ai-market-analyst/Dockerfile
+    depends_on:
+      market-gateway:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    volumes:
+      - ./storage/logs:/app/storage/logs
+
+  ai-regime-detector:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/ai-regime-detector/Dockerfile
+    depends_on:
+      market-gateway:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    volumes:
+      - ./storage/logs:/app/storage/logs
+
+  ai-news-risk:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/ai-news-risk/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    volumes:
+      - ./storage/logs:/app/storage/logs
+
+  supervisor:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/supervisor/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    volumes:
+      - ./storage/logs:/app/storage/logs
+      - ./storage/state:/app/storage/state
+
+  # --------------------------------------------------------------------------
+  # Public-facing API and frontend.
+  # --------------------------------------------------------------------------
+  api:
+    <<: *service-defaults
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    ports:
+      - "${API_PORT:-8080}:8000"
+    depends_on:
+      orchestrator:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./storage/logs:/app/storage/logs
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 25s
+
+  frontend:
+    <<: *service-defaults
+    image: node:20-alpine
+    working_dir: /app
+    # Next.js production command (expects built app in ./frontend).
+    command: ["sh", "-c", "npm ci && npm run build && npm run start"]
+    environment:
+      PORT: 3000
+      NODE_ENV: production
+      NEXT_PUBLIC_API_BASE_URL: ${FRONTEND_API_BASE_URL:-http://localhost:8080}
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./frontend:/app
+      - ./storage/logs:/var/log/trading-platform
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000"]
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 40s
+
+# ----------------------------------------------------------------------------
+# Persistent volumes.
+# ----------------------------------------------------------------------------
+volumes:
+  postgres-data:
+    driver: local
+
+# ----------------------------------------------------------------------------
+# Shared internal network.
+# ----------------------------------------------------------------------------
+networks:
+  trading-net:
+    driver: bridge
