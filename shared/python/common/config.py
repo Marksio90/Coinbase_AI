@@ -2,11 +2,19 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
 from threading import Lock
 from typing import Literal
 
-from pydantic import AnyHttpUrl, AnyUrl, BaseModel, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    AnyHttpUrl,
+    AnyUrl,
+    BaseModel,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from .logger import setup_logging
@@ -42,8 +50,8 @@ class CoinbaseConfig(BaseSettings):
 
     api_base_url: AnyHttpUrl = "https://api.coinbase.com"
     ws_url: AnyUrl = "wss://advanced-trade-ws.coinbase.com"
-    api_key: str = ""
-    api_private_key: str = ""
+    api_key: SecretStr = Field(default=SecretStr(""))
+    api_private_key: SecretStr = Field(default=SecretStr(""))
     portfolio_id: str = ""
     http_timeout_seconds: int = 10
 
@@ -103,8 +111,12 @@ class RiskConfig(BaseSettings):
     @classmethod
     def parse_symbols(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):
-            return [item.strip().upper() for item in value.split(",") if item.strip()]
-        return [symbol.strip().upper() for symbol in value if symbol.strip()]
+            parsed = [item.strip().upper() for item in value.split(",") if item.strip()]
+        else:
+            parsed = [symbol.strip().upper() for symbol in value if symbol.strip()]
+        if not parsed:
+            raise ValueError("RISK_ALLOWED_SYMBOLS cannot be empty")
+        return parsed
 
     @field_validator("max_notional_usd", "daily_max_loss_usd")
     @classmethod
@@ -144,6 +156,14 @@ class InfraConfig(BaseSettings):
             raise ValueError("port value must be between 1 and 65535")
         return value
 
+    @field_validator("redis_host", "postgres_host", "postgres_db", "postgres_user", "api_host")
+    @classmethod
+    def non_empty_host_values(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not cleaned:
+            raise ValueError("infra host/user/db values cannot be empty")
+        return cleaned
+
 
 class OpenAIConfig(BaseSettings):
     """OpenAI model and resilience configuration."""
@@ -151,7 +171,7 @@ class OpenAIConfig(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="OPENAI_", extra="ignore")
 
     base_url: AnyHttpUrl = "https://api.openai.com/v1"
-    api_key: str = ""
+    api_key: SecretStr = Field(default=SecretStr(""))
     model_primary: str = "gpt-5.1"
     model_fallback: str = "gpt-4.1-mini"
     timeout_seconds: int = 30
@@ -181,6 +201,10 @@ class PlatformConfig(BaseModel):
             raise ValueError("live trading requires ENABLE_EXECUTION=true")
         if self.trading.enable_execution and not self.trading.enable_trading:
             raise ValueError("ENABLE_EXECUTION requires ENABLE_TRADING=true")
+        if self.trading.mode == "live" and not self.coinbase.api_key.get_secret_value().strip():
+            raise ValueError("live trading requires COINBASE_API_KEY")
+        if self.trading.enable_ai and not self.openai.api_key.get_secret_value().strip():
+            raise ValueError("ENABLE_AI=true requires OPENAI_API_KEY")
         return self
 
 
@@ -216,7 +240,6 @@ def _build_config() -> PlatformConfig:
         raise
 
 
-@lru_cache(maxsize=1)
 def get_config() -> PlatformConfig:
     """Lazy-loaded singleton config accessor for application runtime."""
 
@@ -228,3 +251,11 @@ def get_config() -> PlatformConfig:
         if _singleton_instance is None:
             _singleton_instance = _build_config()
     return _singleton_instance
+
+
+def reset_config_singleton() -> None:
+    """Reset singleton cache (used in tests and controlled reload flows)."""
+
+    global _singleton_instance
+    with _singleton_lock:
+        _singleton_instance = None
